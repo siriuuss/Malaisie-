@@ -1,0 +1,6 @@
+.agents/
+.claude/skills/
+node_modules/
+renders/
+snapshots/
+.DS_Store
