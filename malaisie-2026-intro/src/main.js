@@ -3,6 +3,8 @@ import { FontLoader } from "three/addons/loaders/FontLoader.js";
 import { buildSpace, STOPS, MARKER_TIMES, RETURN_TIME } from "./space.js";
 import { buildGround } from "./ground.js";
 import { makeNoiseCanvas, smootherstep, clamp, invLerp, easeOutCubic } from "./util.js";
+import { createPipeline } from "./render.js";
+import { SUN_DIR } from "./space.js";
 
 const W = 1920;
 const H = 1080;
@@ -11,15 +13,22 @@ const CUT_GROUND = 9.0;
 
 const vars = window.__hyperframes?.getVariables?.() ?? {};
 const renderScale = Number(vars.renderScale ?? 1);
+// Dev-only switches for profiling (window.__malaisieFlags set before load).
+const FLAGS = { msaa: 4, shadows: true, post: true, ...(window.__malaisieFlags ?? {}) };
 
 const canvas = document.getElementById("three-layer");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true, powerPreference: "high-performance" });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
+const RW = Math.round(W * renderScale);
+const RH = Math.round(H * renderScale);
 renderer.setPixelRatio(1);
-renderer.setSize(Math.round(W * renderScale), Math.round(H * renderScale), false);
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
+renderer.setSize(RW, RH, false);
+// Tone mapping, grade and sRGB encoding happen in the final post pass (render.js).
+renderer.toneMapping = THREE.NoToneMapping;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.autoClear = false;
+renderer.shadowMap.enabled = FLAGS.shadows;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+const pipeline = createPipeline(renderer, RW, RH, { msaa: FLAGS.msaa, post: FLAGS.post });
 
 const camera = new THREE.PerspectiveCamera(35, W / H, 0.01, 1000);
 
@@ -130,24 +139,54 @@ function updateLabels(t, space) {
 async function init() {
   const { tex, font } = await loadAssets();
   const space = buildSpace(tex);
-  const ground = buildGround(tex, font);
+  const ground = buildGround(tex, font, renderer);
   const wall = buildCloudWall(tex);
+  let override = null; // debug-only camera override (window.__malaisieDebug)
 
   function renderAt(time) {
     const t = Math.max(0, time);
-    renderer.clear();
-    if (t < CUT_GROUND) {
+    const inSpace = t < CUT_GROUND;
+    let fx;
+    if (inSpace) {
       space.update(t, camera);
-      renderer.render(space.scene, camera);
+      fx = {
+        sunDir: SUN_DIR,
+        aperture: 0,
+        rays: 0.35 * (1 - smootherstep(2.5, 3.5, t)),
+        raysThreshold: 2.0,
+        bloom: 0.75,
+        bloomRadius: 0.6,
+        bloomThreshold: 0.9,
+        exposure: 1.0,
+        vignette: 0.42,
+        warmth: 0.06,
+        saturation: 1.05,
+        contrast: 1.08,
+      };
     } else {
-      ground.update(t, camera);
-      renderer.render(ground.scene, camera);
+      fx = ground.update(t, camera);
     }
-    if (wall.update(t)) renderer.render(wall.scene, wall.cam);
+    if (override) override(camera, t);
+    fx.camera = camera;
+    fx.frame = Math.round(t * 24);
+    const showWall = wall.update(t);
+    pipeline.render(() => {
+      renderer.render(inSpace ? space.scene : ground.scene, camera);
+      if (showWall) renderer.render(wall.scene, wall.cam);
+    }, fx);
     updateLabels(t, space);
   }
 
   window.addEventListener("hf-seek", (e) => renderAt(e.detail.time));
+  window.__malaisieDebug = {
+    renderAt,
+    camera,
+    groundScene: ground.scene,
+    THREE,
+    setOverride(fn) {
+      override = fn;
+    },
+  };
   // Compile everything once so the first captured frame is not a cold start.
   renderer.compile(space.scene, camera);
   renderer.compile(ground.scene, camera);

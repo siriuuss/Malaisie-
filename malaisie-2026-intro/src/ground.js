@@ -3,11 +3,16 @@ import { ImprovedNoise } from "three/addons/math/ImprovedNoise.js";
 import { TextGeometry } from "three/addons/geometries/TextGeometry.js";
 import { makeTrack, mulberry32, smootherstep, clamp, lerp, invLerp, easeOutCubic } from "./util.js";
 import { buildPetronas, TOWER_W, SPIRE_TOP } from "./petronas.js";
+import { buildLandmarks, LANDMARKS } from "./landmarks.js";
+import { buildCity, BLOCK, ROAD, AVENUE, AVENUE_EVERY, GRID_ROT } from "./city.js";
+import { createFoliageMaterial, scatterTrees } from "./forest.js";
+import { createSkyMaterial, createSkyMesh, bakeEnvironment } from "./sky.js";
+import { buildWings, headYawOffset } from "./bird.js";
 
-// World units are metres. The flight heads roughly -Z; KL lies beyond the jungle.
+// World units are metres; +X = east, +Z = north. The bird flies south from the jungle
+// north of KL (Batu Caves side) toward KLCC; the sun sets in the west-south-west.
 export const JUNGLE_END_Z = -430;
 export const CITY_CENTER = new THREE.Vector3(0, 0, -1300);
-// Title stands over the river, in a clearing so the letters read cleanly.
 export const TITLE_Z = -60;
 export const TITLE_POS = new THREE.Vector3(0, 0, TITLE_Z);
 
@@ -29,222 +34,184 @@ function fbm(x, z, oct = 5) {
   return s / n;
 }
 
-// Hilly jungle that carves a river valley and flattens into the KL plain.
+const HILL = { x: CITY_CENTER.x + LANDMARKS.menaraKL.x, z: CITY_CENTER.z + LANDMARKS.menaraKL.z };
 export function terrainHeight(x, z) {
   const hills = 75 * (fbm(x, z) + 0.35) + 40 * Math.max(0, fbm(x + 900, z - 300, 3));
   const d = Math.abs(x - riverX(z));
   const valley = 1 - Math.exp(-((d / 95) ** 2));
   let h = -6 + hills * valley + 8 * (1 - valley);
   const city = smootherstep(JUNGLE_END_Z + 60, JUNGLE_END_Z - 260, z);
-  h = lerp(h, 4 + 6 * fbm(x * 3, z * 3, 2), city);
+  h = lerp(h, 4 + 3 * fbm(x * 2, z * 2, 2), city);
+  // Bukit Nanas, the forested hill under Menara KL
+  h += 48 * Math.exp(-((Math.hypot(x - HILL.x, z - HILL.z) / 210) ** 2));
   return h;
 }
 
-// Sunset sun: low over the front-left of the flight, sinking through the shot.
 export function sunDirAt(t) {
-  const el = THREE.MathUtils.degToRad(lerp(9, 2.2, smootherstep(10, 21, t)));
+  const el = THREE.MathUtils.degToRad(lerp(9, 2.3, smootherstep(10, 21, t)));
   const az = new THREE.Vector3(-0.75, 0, -0.66).normalize();
   return new THREE.Vector3(az.x * Math.cos(el), Math.sin(el), az.z * Math.cos(el)).normalize();
 }
 
-export function buildGround(tex, font) {
+function setSky(u, t) {
+  const k = smootherstep(13, 21, t);
+  u.uSun.value.copy(sunDirAt(t));
+  u.uHorizon.value.set("#F4B56E").lerp(new THREE.Color("#F27A30"), k);
+  u.uZenith.value.set("#4A6A9C").lerp(new THREE.Color("#33477C"), k);
+  u.uAnti.value.set("#9AA7C2").lerp(new THREE.Color("#7C6A92"), k);
+  u.uSunCol.value.set("#FFE1A8").lerp(new THREE.Color("#FFB070"), k);
+  u.uCloud.value = 0.7;
+}
+
+export function buildGround(tex, font, renderer) {
   const scene = new THREE.Scene();
-  const fogColor = new THREE.Color("#E9B97C");
-  scene.fog = new THREE.FogExp2(fogColor, 0.0018);
+  scene.fog = new THREE.FogExp2(new THREE.Color("#E9B97C"), 0.0018);
 
-  // ---- Sky dome ---------------------------------------------------------------
-  const skyUniforms = {
-    uSun: { value: sunDirAt(10) },
-    uHorizon: { value: new THREE.Color("#F2B06A") },
-    uZenith: { value: new THREE.Color("#3D5A8A") },
-    uSunCol: { value: new THREE.Color("#FFD9A0") },
-  };
-  const sky = new THREE.Mesh(
-    new THREE.SphereGeometry(9000, 64, 32),
-    new THREE.ShaderMaterial({
-      uniforms: skyUniforms,
-      side: THREE.BackSide,
-      depthWrite: false,
-      vertexShader: /* glsl */ `
-        varying vec3 vDir;
-        void main(){ vDir = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
-      fragmentShader: /* glsl */ `
-        uniform vec3 uSun; uniform vec3 uHorizon; uniform vec3 uZenith; uniform vec3 uSunCol;
-        varying vec3 vDir;
-        void main(){
-          vec3 d = normalize(vDir);
-          float h = clamp(d.y, -0.2, 1.0);
-          vec3 col = mix(uHorizon, uZenith, pow(clamp(h, 0.0, 1.0), 0.45));
-          float mu = clamp(dot(d, uSun), 0.0, 1.0);
-          col += uSunCol * (pow(mu, 8.0) * 0.55 + pow(mu, 64.0) * 1.2);
-          col += uSunCol * smoothstep(0.99955, 0.9997, mu) * 18.0; // sun disc (HDR for bloom)
-          col = mix(col, uHorizon * 0.9, smoothstep(0.02, -0.15, d.y));
-          gl_FragColor = vec4(col, 1.0);
-        }`,
-    }),
-  );
-  sky.frustumCulled = false;
-  scene.add(sky);
+  // ---- Sky + baked environments ----------------------------------------------------
+  const sky = createSkyMaterial();
+  const skyMesh = createSkyMesh(sky.material);
+  scene.add(skyMesh);
+  setSky(sky.uniforms, 12);
+  const envJungle = bakeEnvironment(renderer, sky.material);
+  setSky(sky.uniforms, 19.5);
+  const envCity = bakeEnvironment(renderer, sky.material);
 
-  // ---- Lights -----------------------------------------------------------------
-  const sun = new THREE.DirectionalLight(0xffc98a, 3.0);
+  // ---- Lights -----------------------------------------------------------------------
+  const sun = new THREE.DirectionalLight(0xffc98a, 3.2);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.bias = -0.0004;
+  sun.shadow.normalBias = 0.6;
   scene.add(sun, sun.target);
-  const hemi = new THREE.HemisphereLight(0xffc690, 0x1c3a24, 0.9);
+  const hemi = new THREE.HemisphereLight(0xffc690, 0x1c2a1c, 0.35);
   scene.add(hemi);
 
-  // ---- Terrain ----------------------------------------------------------------
-  const size = 4200;
-  const seg = 280;
-  const tGeo = new THREE.PlaneGeometry(size, size, seg, seg);
-  tGeo.rotateX(-Math.PI / 2);
-  tGeo.translate(0, 0, -700);
-  {
-    const p = tGeo.attributes.position;
-    const col = new Float32Array(p.count * 3);
-    const jungle = new THREE.Color("#143826");
-    const moss = new THREE.Color("#2A5A33");
-    const plain = new THREE.Color("#5B5A48");
-    const c = new THREE.Color();
-    for (let i = 0; i < p.count; i++) {
-      const x = p.getX(i);
-      const z = p.getZ(i);
-      const h = terrainHeight(x, z);
-      p.setY(i, h);
-      c.copy(jungle).lerp(moss, clamp(h / 90));
-      c.lerp(plain, smootherstep(JUNGLE_END_Z, JUNGLE_END_Z - 200, z));
-      col.set([c.r, c.g, c.b], i * 3);
-    }
-    tGeo.setAttribute("color", new THREE.BufferAttribute(col, 3));
-    tGeo.computeVertexNormals();
-  }
-  const terrain = new THREE.Mesh(tGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }));
-  scene.add(terrain);
-  const farGround = new THREE.Mesh(new THREE.CircleGeometry(30000, 64), new THREE.MeshStandardMaterial({ color: 0x4a4a3a, roughness: 1 }));
+  // ---- Terrain: detailed jungle tile + city plain ------------------------------------
+  const makeTerrain = (x0, x1, z0, z1, step, material) => {
+    const w = x1 - x0;
+    const d = z0 - z1;
+    const g = new THREE.PlaneGeometry(w, d, Math.round(w / step), Math.round(d / step));
+    g.rotateX(-Math.PI / 2);
+    g.translate((x0 + x1) / 2, 0, (z0 + z1) / 2);
+    const p = g.attributes.position;
+    for (let i = 0; i < p.count; i++) p.setY(i, terrainHeight(p.getX(i), p.getZ(i)));
+    g.computeVertexNormals();
+    const m = new THREE.Mesh(g, material);
+    m.receiveShadow = true;
+    return m;
+  };
+  const jungleGround = new THREE.MeshStandardMaterial({ color: 0x1a2a17, roughness: 1 });
+  scene.add(makeTerrain(-2300, 2300, 950, -660, 14, jungleGround));
+  const cityGround = createCityGroundMaterial(CITY_CENTER);
+  scene.add(makeTerrain(-6400, 4400, -640, -8200, 24, cityGround));
+  const farGround = new THREE.Mesh(new THREE.CircleGeometry(40000, 64), new THREE.MeshStandardMaterial({ color: 0x5a554a, roughness: 1 }));
   farGround.rotation.x = -Math.PI / 2;
-  farGround.position.set(0, -8, -700);
+  farGround.position.set(0, -2, -2000);
   scene.add(farGround);
 
-  // ---- River ribbon -----------------------------------------------------------
+  // ---- River ----------------------------------------------------------------------------
+  const water = createWaterMaterial();
   {
-    const pts = [];
-    for (let z = 700; z >= JUNGLE_END_Z - 120; z -= 10) pts.push([riverX(z), z]);
     const pos = [];
     const idx = [];
-    pts.forEach(([x, z], i) => {
+    let i = 0;
+    for (let z = 950; z >= JUNGLE_END_Z - 160; z -= 6, i++) {
+      const x = riverX(z);
       const w = 16 + 5 * Math.sin(z / 40);
       pos.push(x - w, -1.2, z, x + w, -1.2, z);
       if (i > 0) {
         const a = (i - 1) * 2;
         idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
       }
-    });
+    }
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
     g.setIndex(idx);
     g.computeVertexNormals();
-    const water = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x2e6b6a, roughness: 0.08, metalness: 0.6, emissive: 0x6b4a22, emissiveIntensity: 0.6 }));
-    scene.add(water);
+    const river = new THREE.Mesh(g, water);
+    river.receiveShadow = true;
+    scene.add(river);
   }
 
-  // ---- Jungle trees (InstancedMesh) ------------------------------------------
+  // ---- Jungle --------------------------------------------------------------------------
+  const sunDir0 = sunDirAt(12);
+  const foliage = createFoliageMaterial(sunDir0.clone());
+  const jungle = new THREE.Group();
+  scene.add(jungle);
   {
-    const rand = mulberry32(101);
-    const crown = new THREE.IcosahedronGeometry(1, 1);
-    crown.scale(1, 0.75, 1);
-    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, flatShading: true });
-    const max = 60000;
-    const mesh = new THREE.InstancedMesh(crown, mat, max);
-    const m = new THREE.Matrix4();
-    const q = new THREE.Quaternion();
-    const s = new THREE.Vector3();
-    const pv = new THREE.Vector3();
-    const c = new THREE.Color();
-    const shades = ["#143826", "#1F4A2E", "#2A5A33", "#3B6A35", "#5C7F3A"].map((h) => new THREE.Color(h));
-    let n = 0;
-    for (let i = 0; i < max * 3 && n < max; i++) {
-      const x = (rand() - 0.5) * 2600 + riverX(0) * 0;
-      const z = 650 - rand() * (650 - (JUNGLE_END_Z - 60));
-      const edge = JUNGLE_END_Z + 40 * fbm(x * 4, 0, 2);
-      if (z < edge) continue;
-      if (Math.abs(x - riverX(z)) < 24) continue;
-      if (Math.hypot(x - TITLE_POS.x, (z - TITLE_POS.z) * 1.6) < 95) continue;
-      const h = terrainHeight(x, z);
-      const r = 4.5 + rand() * 6;
-      pv.set(x, h + r * 0.8 + 8 + rand() * 10, z);
-      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rand() * Math.PI * 2);
-      s.set(r, r * (0.8 + rand() * 0.5), r);
-      m.compose(pv, q, s);
-      mesh.setMatrixAt(n, m);
-      c.copy(shades[Math.floor(rand() * shades.length)]);
-      mesh.setColorAt(n, c);
-      n++;
-    }
-    mesh.count = n;
-    scene.add(mesh);
+    const near = scatterTrees({
+      count: 14000,
+      seed: 101,
+      material: foliage,
+      place: (i, r) => {
+        const z = 950 - r() * (950 - (JUNGLE_END_Z - 90));
+        const x = riverX(z) + (r() - 0.5) * 900;
+        const edge = JUNGLE_END_Z + 50 * fbm(x * 4, 0, 2);
+        if (z < edge) return null;
+        if (Math.abs(x - riverX(z)) < 22 + r() * 6) return null;
+        if (Math.hypot(x - TITLE_POS.x, (z - TITLE_POS.z) * 1.6) < 95) return null;
+        const emergent = r() < 0.08;
+        const rr = emergent ? 11 + r() * 6 : 5 + r() * 4.5;
+        const lift = emergent ? 30 + r() * 10 : 14 + r() * 12;
+        return { x, y: terrainHeight(x, z) + lift, z, r: rr, hScale: emergent ? 0.75 : 1 };
+      },
+    });
+    near.forEach((m) => jungle.add(m));
+    const far = scatterTrees({
+      count: 14000,
+      seed: 202,
+      material: foliage,
+      castShadow: false,
+      simple: true,
+      cell: 600,
+      place: (i, r) => {
+        const z = 950 - r() * (950 - (JUNGLE_END_Z - 60));
+        const off = (r() < 0.5 ? -1 : 1) * (450 + r() * 1400);
+        const x = riverX(z) + off;
+        if (z < JUNGLE_END_Z + 50 * fbm(x * 4, 0, 2)) return null;
+        const rr = 7 + r() * 6;
+        return { x, y: terrainHeight(x, z) + 18 + r() * 12, z, r: rr };
+      },
+    });
+    far.forEach((m) => jungle.add(m));
   }
 
-  // ---- KL skyline (procedural) ------------------------------------------------
-  {
-    const rand = mulberry32(303);
-    const box = new THREE.BoxGeometry(1, 1, 1);
-    box.translate(0, 0.5, 0);
-    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6, metalness: 0.2 });
-    const max = 1600;
-    const mesh = new THREE.InstancedMesh(box, mat, max);
-    const m = new THREE.Matrix4();
-    const c = new THREE.Color();
-    let n = 0;
-    for (let i = 0; i < max * 4 && n < max; i++) {
-      const x = (rand() - 0.5) * 2400;
-      const z = JUNGLE_END_Z - 140 - rand() * 2000;
-      const d = Math.hypot(x - CITY_CENTER.x, z - CITY_CENTER.z);
-      if (d < 170) continue; // KLCC park around the towers
-      const core = Math.exp(-((d / 650) ** 2));
-      const h = 15 + rand() * 50 + core * rand() * 230;
-      const w = 18 + rand() * 30;
-      const dd = 18 + rand() * 30;
-      m.compose(new THREE.Vector3(x, terrainHeight(x, z) - 2, z), new THREE.Quaternion(), new THREE.Vector3(w, h, dd));
-      mesh.setMatrixAt(n, m);
-      c.setHSL(0.07 + rand() * 0.05, 0.12, 0.45 + rand() * 0.25);
-      mesh.setColorAt(n, c);
-      n++;
-    }
-    mesh.count = n;
-    scene.add(mesh);
-  }
-
-  // ---- Petronas Towers --------------------------------------------------------
+  // ---- Kuala Lumpur ----------------------------------------------------------------------
+  const extent = (x, z) => {
+    if (z > JUNGLE_END_Z - 40) return false;
+    if (z < -8000 || x < -6200 || x > 4200) return false;
+    if (z > -760) return "fringe";
+    return true;
+  };
+  const city = buildCity({ C: CITY_CENTER, terrainHeight, sunDir: sunDir0, foliageMat: foliage, extent });
+  scene.add(city.group);
   const petronas = buildPetronas();
   petronas.position.copy(CITY_CENTER);
+  petronas.position.y = terrainHeight(CITY_CENTER.x, CITY_CENTER.z) - 0.5;
   scene.add(petronas);
+  const landmarks = buildLandmarks((x, z) => terrainHeight(x + CITY_CENTER.x, z + CITY_CENTER.z));
+  landmarks.position.set(CITY_CENTER.x, 0, CITY_CENTER.z);
+  scene.add(landmarks);
+  const facadeMats = [...city.group.userData.facadeMats, ...petronas.userData.facadeMats, ...landmarks.userData.facadeMats];
 
-  // ---- Bird silhouette on the west tower's spire ------------------------------
-  const bird = buildBird();
-  bird.position.set(CITY_CENTER.x - TOWER_W, SPIRE_TOP + 0.05, CITY_CENTER.z);
-  {
-    // Face the beak across the frame (profile) relative to the final camera.
-    const sd = sunDirAt(21.5);
-    const side = new THREE.Vector3().crossVectors(sd, new THREE.Vector3(0, 1, 0)).normalize();
-    bird.rotation.y = Math.atan2(-side.z, side.x) + Math.PI;
-  }
-  scene.add(bird);
-
-  // ---- Title: MALAISIE 2026, one mesh per glyph so letters can rise from the mist
+  // ---- Title: MALAISIE 2026 ----------------------------------------------------------------
   const title = new THREE.Group();
   const letters = [];
   {
     const text = "MALAISIE 2026";
     const size = 15;
-    const goldMat = new THREE.MeshStandardMaterial({ color: 0xe3a947, metalness: 0.85, roughness: 0.28, emissive: 0x3a2205, emissiveIntensity: 0.4 });
+    const gold = new THREE.MeshStandardMaterial({ color: 0xe8b04f, metalness: 1, roughness: 0.2, envMapIntensity: 1.3 });
     let x = 0;
     const glyphs = font.data.glyphs;
     const scale = size / font.data.resolution;
     for (const ch of text) {
       const adv = (glyphs[ch]?.ha ?? 300) * scale;
       if (ch !== " ") {
-        const g = new TextGeometry(ch, { font, size, depth: 3.5, curveSegments: 8, bevelEnabled: true, bevelThickness: 0.6, bevelSize: 0.4, bevelSegments: 3 });
-        const mesh = new THREE.Mesh(g, goldMat);
+        const g = new TextGeometry(ch, { font, size, depth: 3.5, curveSegments: 10, bevelEnabled: true, bevelThickness: 0.6, bevelSize: 0.42, bevelSegments: 4 });
+        const mesh = new THREE.Mesh(g, gold);
         mesh.position.x = x;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
         title.add(mesh);
         letters.push(mesh);
       }
@@ -252,30 +219,34 @@ export function buildGround(tex, font) {
     }
     title.children.forEach((c) => (c.position.x -= x / 2));
   }
-  // Stands over the river's left bank, angled toward the approaching camera.
   title.position.copy(TITLE_POS);
   title.rotation.y = 0.55;
   scene.add(title);
 
-  // ---- Mist banks (soft noise sprites) ----------------------------------------
-  const mist = [];
+  // ---- Mist banks + cloud deck -----------------------------------------------------------
+  const mistGroup = new THREE.Group();
+  scene.add(mistGroup);
   {
     const rand = mulberry32(77);
-    const mat = new THREE.SpriteMaterial({ map: tex.mist, color: 0xf1ddbb, transparent: true, depthWrite: false, opacity: 0.32, fog: true });
-    for (let i = 0; i < 140; i++) {
-      const z = 500 - rand() * 1000;
-      const x = riverX(z) + (rand() - 0.5) * 700;
+    const mat = new THREE.SpriteMaterial({ map: tex.mist, color: 0xf3e2c6, transparent: true, depthWrite: false, opacity: 0.3, fog: true });
+    for (let i = 0; i < 160; i++) {
+      const z = 600 - rand() * 1050;
+      const x = riverX(z) + (rand() - 0.5) * 800;
       const sp = new THREE.Sprite(mat);
-      const w = 140 + rand() * 220;
-      sp.scale.set(w, w * 0.28, 1);
-      sp.position.set(x, terrainHeight(x, z) + 22 + rand() * 18, z);
-      sp.material.rotation = 0;
-      scene.add(sp);
-      mist.push(sp);
+      const w = 140 + rand() * 240;
+      sp.scale.set(w, w * 0.22, 1);
+      sp.position.set(x, terrainHeight(x, z) + 20 + rand() * 16, z);
+      mistGroup.add(sp);
+    }
+    // the title's own mist bank
+    for (let i = 0; i < 14; i++) {
+      const sp = new THREE.Sprite(mat);
+      const w = 70 + rand() * 90;
+      sp.scale.set(w, w * 0.3, 1);
+      sp.position.set(TITLE_POS.x + (rand() - 0.5) * 170, 2 + rand() * 9, TITLE_POS.z + (rand() - 0.5) * 70);
+      mistGroup.add(sp);
     }
   }
-
-  // ---- Cloud deck the camera descends through (9 → 10 s) ----------------------
   const deck = new THREE.Group();
   scene.add(deck);
   {
@@ -289,18 +260,22 @@ export function buildGround(tex, font) {
     }
   }
 
-  // ---- Camera (bird flight) ---------------------------------------------------
+  // ---- The bird's wings (seen from its eyes) --------------------------------------------
+  const wings = buildWings();
+  scene.add(wings.rig);
+
+  // ---- Camera = the bird's eyes --------------------------------------------------------------
   const rp = (z, alt, dx = 0) => [riverX(z) + dx, alt, z];
-  const T = new THREE.Vector3(CITY_CENTER.x - TOWER_W, SPIRE_TOP, CITY_CENTER.z); // landing spire tip
-  // Reveal: camera sits on the bird→sun line so the bird is silhouetted on the disc,
-  // nudged so the pair lands slightly right of centre.
-  const BIRD_EYE = T.clone().add(new THREE.Vector3(0, 0.32, 0));
-  const revealAt = (t, dist) => BIRD_EYE.clone().addScaledVector(sunDirAt(t), -dist).add(new THREE.Vector3(0, -0.12, 0)).toArray();
-  const revealTarget = (t) => {
-    const s = sunDirAt(t);
-    const side = new THREE.Vector3().crossVectors(s, new THREE.Vector3(0, 1, 0)).normalize();
-    return BIRD_EYE.clone().addScaledVector(s, 12).addScaledVector(side, -2.2).add(new THREE.Vector3(0, 0.6, 0)).toArray();
-  };
+  const T = new THREE.Vector3(CITY_CENTER.x - TOWER_W, SPIRE_TOP + petronas.position.y, CITY_CENTER.z); // west tower needle tip
+  const EYE = T.clone().add(new THREE.Vector3(0, 0.34, 0));
+  const HEADING = new THREE.Vector3(-0.7, 0, 0.7).normalize(); // lands facing north-west
+  // Gaze after the head turn: toward the sunset between Merdeka 118 and Menara KL.
+  const azimuth = (v) => Math.atan2(-v.z, v.x); // grows with a +Y rotation
+  let GAZE_YAW = azimuth(new THREE.Vector3(-0.7, 0, -0.71)) - azimuth(HEADING);
+  GAZE_YAW = Math.atan2(Math.sin(GAZE_YAW), Math.cos(GAZE_YAW)); // shortest turn (~ -90°)
+  const approach = (k, dy = 0) => EYE.clone().addScaledVector(HEADING, -k).add(new THREE.Vector3(0, dy, 0)).toArray();
+  const look = (k, dy = 0) => EYE.clone().addScaledVector(HEADING, k).add(new THREE.Vector3(0, dy, 0)).toArray();
+
   const camPos = makeTrack([
     { t: 9.0, v: rp(560, 900) },
     { t: 10.1, v: rp(380, 140) },
@@ -310,15 +285,14 @@ export function buildGround(tex, font) {
     { t: 14.3, v: rp(-100, 44, 55) },
     { t: 15.2, v: rp(-200, 52, 20) },
     { t: 16.2, v: rp(-300, 72) },
-    { t: 17.2, v: [-150, 185, -650] },
-    { t: 18.0, v: [-280, 300, -1000] },
-    { t: 18.7, v: [-60, 375, -950] },
-    { t: 19.3, v: [150, 420, -1080] },
-    { t: 19.85, v: [T.x + 94, T.y - 3, T.z + 83] },
-    { t: 20.35, v: [T.x + 0.45, T.y + 0.85, T.z + 0.4], hold: true },
-    { t: 20.55, v: [T.x + 0.45, T.y + 0.72, T.z + 0.4], hold: true },
-    { t: 21.0, v: revealAt(21.0, 15.5), hold: true },
-    { t: 22.0, v: revealAt(22.0, 16.3) },
+    { t: 17.1, v: [120, 170, -700] },
+    { t: 17.9, v: [300, 280, -1080] },
+    { t: 18.6, v: [290, 350, -1470] },
+    { t: 19.25, v: [110, 405, -1560] },
+    { t: 19.8, v: approach(85, -4) },
+    { t: 20.15, v: approach(9, 0.8) },
+    { t: 20.33, v: EYE.toArray(), hold: true },
+    { t: 22.0, v: EYE.toArray() },
   ]);
   const camTgt = makeTrack([
     { t: 9.0, v: rp(250, 0) },
@@ -328,28 +302,26 @@ export function buildGround(tex, font) {
     { t: 13.4, v: [TITLE_POS.x + 10, 30, TITLE_Z - 10] },
     { t: 14.3, v: rp(-260, 40) },
     { t: 15.2, v: rp(-360, 70) },
-    { t: 16.2, v: [0, 200, -1300] },
-    { t: 17.2, v: [0, 260, -1300] },
-    { t: 18.0, v: [0, 300, -1300] },
-    { t: 18.7, v: [0, 340, -1300] },
-    { t: 19.3, v: [-20, 400, -1300] },
-    { t: 19.85, v: [T.x, T.y, T.z] },
-    { t: 20.35, v: [T.x - 45, T.y - 5, T.z - 40], hold: true },
-    { t: 20.55, v: [T.x - 45, T.y - 7, T.z - 40], hold: true },
-    { t: 21.0, v: revealTarget(21.0), hold: true },
-    { t: 22.0, v: revealTarget(22.0) },
+    { t: 16.2, v: [0, 220, -1300] },
+    { t: 17.1, v: [0, 260, -1300] },
+    { t: 17.9, v: [0, 300, -1300] },
+    { t: 18.6, v: [-20, 340, -1300] },
+    { t: 19.25, v: [T.x, 420, T.z] },
+    { t: 19.8, v: [T.x, T.y, T.z] },
+    { t: 20.15, v: look(60, -9) },
+    { t: 20.33, v: look(60, -7), hold: true },
+    { t: 22.0, v: look(60, -6) },
   ]);
   const camFov = makeTrack([
-    { t: 9.0, v: 50 },
-    { t: 11, v: 48 },
-    { t: 16, v: 50 },
-    { t: 18.7, v: 56 },
-    { t: 20.35, v: 50 },
-    { t: 20.55, v: 50 },
-    { t: 21.0, v: 22 },
-    { t: 22.0, v: 21 },
+    { t: 9.0, v: 52 },
+    { t: 11, v: 50 },
+    { t: 16, v: 52 },
+    { t: 18.6, v: 58 },
+    { t: 20.33, v: 62 },
+    { t: 20.95, v: 60 },
+    { t: 21.75, v: 44 },
+    { t: 22.0, v: 43.5 },
   ]);
-  // Bank (roll) into the turns, in radians.
   const camRoll = makeTrack([
     { t: 9.0, v: 0 },
     { t: 11.0, v: 0.06 },
@@ -358,81 +330,205 @@ export function buildGround(tex, font) {
     { t: 14.3, v: 0.1 },
     { t: 15.2, v: -0.05 },
     { t: 16.2, v: 0 },
-    { t: 17.2, v: 0.08 },
-    { t: 18.0, v: 0.14 },
-    { t: 18.7, v: -0.1 },
-    { t: 19.3, v: -0.16 },
-    { t: 19.85, v: -0.05 },
-    { t: 20.35, v: 0 },
+    { t: 17.1, v: -0.12 },
+    { t: 17.9, v: -0.16 },
+    { t: 18.6, v: -0.2 },
+    { t: 19.25, v: -0.12 },
+    { t: 19.8, v: 0.02 },
+    { t: 20.33, v: 0 },
     { t: 22.0, v: 0 },
   ]);
 
   const tmp = new THREE.Vector3();
   const fwd = new THREE.Vector3();
+  const sunFocus = new THREE.Vector3();
+  const yAxis = new THREE.Vector3(0, 1, 0);
   function update(t, camera) {
     const s = sunDirAt(t);
-    skyUniforms.uSun.value.copy(s);
-    const k = smootherstep(14, 21, t);
-    skyUniforms.uHorizon.value.set("#F2B06A").lerp(new THREE.Color("#F2792B"), k);
-    skyUniforms.uZenith.value.set("#3D5A8A").lerp(new THREE.Color("#2A2F5E"), k);
-    scene.fog.color.copy(skyUniforms.uHorizon.value).lerp(new THREE.Color("#F1DDBB"), 0.25 * (1 - k));
-    scene.fog.density = lerp(0.0018, 0.00055, smootherstep(15.2, 17.6, t));
-    sun.position.copy(s).multiplyScalar(2000).add(camera.position);
-    sun.target.position.copy(camera.position);
-    sun.color.set("#FFC98A").lerp(new THREE.Color("#FF8E4A"), k);
-
+    setSky(sky.uniforms, t);
+    const k = smootherstep(13, 21, t);
+    scene.environment = t < 15.6 ? envJungle : envCity;
+    scene.environmentIntensity = lerp(0.9, 0.75, k);
+    // fog takes the sky's own horizon colour in the viewing direction so the haze melts into it
+    camera.getWorldDirection(fwd);
+    fwd.y = 0;
+    fwd.normalize();
+    const mu = fwd.dot(new THREE.Vector3(s.x, 0, s.z).normalize());
+    const hz = sky.uniforms.uAnti.value.clone().lerp(sky.uniforms.uHorizon.value, smootherstep(-0.6, 0.7, mu));
+    hz.add(sky.uniforms.uSunCol.value.clone().multiplyScalar(0.3 * smootherstep(-0.2, 1.0, mu)));
+    scene.fog.color.copy(hz).lerp(new THREE.Color("#F1DDBB"), 0.25 * (1 - k));
+    sky.uniforms.uFog.value.copy(scene.fog.color);
+    sky.uniforms.uFogAmt.value = 0.92;
+    scene.fog.density = lerp(lerp(0.0016, 0.00034, smootherstep(15.2, 17.6, t)), 0.00026, smootherstep(19.6, 20.6, t));
+    sun.color.set("#FFD29A").lerp(new THREE.Color("#FF9A55"), k);
+    sun.intensity = lerp(3.3, 2.4, k);
+    hemi.intensity = lerp(0.35, 0.25, k);
+    foliage.userData.uniforms.uSunDir.value.copy(s);
+    for (const m of facadeMats) m.userData.uniforms.uLights.value = lerp(0.0, 0.32, smootherstep(18.5, 21.8, t));
+    city.carMaterial.userData.uniforms.uLights.value = lerp(0.2, 1.0, smootherstep(16, 21, t));
+    water.userData.uniforms.uTime.value = t;
     deck.visible = t < 10.6;
-    bird.visible = t >= 20.5;
+    mistGroup.visible = t < 16.6;
+    jungle.visible = t < 19.0 || (t > 19.9 && t < 20.9); // the NW hills seen just after touchdown
+    city.group.visible = t > 14.6;
+    petronas.visible = landmarks.visible = t > 14.6;
+    title.visible = t < 16;
+    city.updateTraffic(t);
+
     // Title letters rise out of the mist, staggered.
     letters.forEach((l, i) => {
       const r = easeOutCubic(clamp(invLerp(11.4 + i * 0.09, 12.9 + i * 0.09, t)));
       l.position.y = lerp(-22, 24, r);
     });
 
+    // ---- the bird's eyes
     camera.position.fromArray(camPos(t));
-    // Landing jolt: a damped dip right after touchdown.
-    const jt = t - 20.35;
-    if (jt > 0 && jt < 0.4) camera.position.y -= 0.18 * Math.sin(jt * 26) * Math.exp(-jt * 9);
+    // wingbeat bob while gliding over the jungle (short bursts of flaps)
+    const flap = smootherstep(10.6, 11.0, t) * (1 - smootherstep(11.8, 12.1, t)) + smootherstep(15.0, 15.3, t) * (1 - smootherstep(16.0, 16.4, t));
+    camera.position.y += Math.sin(t * Math.PI * 2 * 3.2) * 0.35 * flap;
+    // touchdown jolt
+    const jt = t - 20.33;
+    if (jt > 0 && jt < 0.45) camera.position.y -= 0.16 * Math.sin(jt * 24) * Math.exp(-jt * 8);
     tmp.fromArray(camTgt(t));
     camera.up.set(0, 1, 0);
     camera.lookAt(tmp);
-    fwd.subVectors(tmp, camera.position).normalize();
     camera.rotateZ(camRoll(t));
+    // head turn after landing: fast yaw about the vertical, slight inquisitive tilt
+    if (t > 20.45) {
+      camera.rotateOnWorldAxis(yAxis, headYawOffset(t, GAZE_YAW));
+      const settle = smootherstep(20.6, 21.1, t);
+      camera.rotateX(-0.02 * settle + Math.sin(t * 1.7) * 0.0015);
+      camera.rotateZ(0.035 * Math.sin(Math.PI * clamp((t - 20.5) / 0.5)) + Math.sin(t * 2.3) * 0.0012);
+    }
     camera.fov = camFov(t);
-    camera.near = t > 20.2 ? 0.05 : 0.5;
-    camera.far = 12000;
+    camera.near = t > 19.9 ? 0.04 : 0.5;
+    camera.far = 30000;
     camera.updateProjectionMatrix();
-    sky.position.copy(camera.position);
+    camera.updateMatrixWorld();
+
+    wings.update(t, camera);
+
+    // Shadow frustum follows the action.
+    camera.getWorldDirection(fwd);
+    const inCity = t > 16.0;
+    const half = inCity ? 1700 : 380;
+    sunFocus.copy(inCity ? CITY_CENTER : camera.position).addScaledVector(fwd, inCity ? 0 : 220);
+    sunFocus.y = inCity ? 150 : terrainHeight(sunFocus.x, sunFocus.z);
+    sun.position.copy(sunFocus).addScaledVector(s, 4000);
+    sun.target.position.copy(sunFocus);
+    const sc = sun.shadow.camera;
+    sc.left = -half;
+    sc.right = half;
+    sc.top = half;
+    sc.bottom = -half;
+    sc.near = 10;
+    sc.far = 9000;
+    sc.updateProjectionMatrix();
+
+    // Post FX for this moment
+    const focus = t > 20.4 ? 1500 : t > 15.5 ? camera.position.distanceTo(CITY_CENTER) : Math.max(60, camera.position.distanceTo(tmp));
+    return {
+      sunDir: s,
+      focus,
+      aperture: t > 19.9 && t < 20.6 ? 6 : t > 20.6 ? 1.2 : t > 11.8 && t < 14.6 ? 4 : t > 15.5 ? 1.0 : 2.0,
+      rays: lerp(0.55, 0.32, k),
+      raysThreshold: 1.4,
+      bloom: lerp(0.5, 0.38, k),
+      bloomThreshold: 1.1,
+      exposure: lerp(1.0, 0.66, smootherstep(19, 21.2, t)),
+      vignette: 0.38,
+      warmth: lerp(0.08, 0.14, k) - 0.1 * smootherstep(19.5, 21.2, t),
+      saturation: lerp(1.04, 0.96, smootherstep(19, 21, t)),
+      contrast: lerp(1.06, 1.16, smootherstep(19, 21, t)),
+    };
   }
 
   return { scene, update };
 }
 
-// Perched raptor (Brahminy kite) built for a clean profile silhouette; local +X = beak.
-function buildBird() {
-  const g = new THREE.Group();
-  const mat = new THREE.MeshBasicMaterial({ color: 0x120c0a, fog: false });
-  const add = (geo, pos, rotZ = 0, scale = [1, 1, 1]) => {
-    const m = new THREE.Mesh(geo, mat);
-    m.position.set(...pos);
-    m.rotation.z = rotZ;
-    m.scale.set(...scale);
-    g.add(m);
-    return m;
+// City ground: asphalt grid with avenues, lane markings, pavements, lots and lawns.
+function createCityGroundMaterial(C) {
+  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 });
+  const f = (v) => v.toFixed(1);
+  mat.customProgramCacheKey = () => "city-ground";
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uRot = { value: GRID_ROT };
+    // KLCC plaza, KLCC Park and the Bukit Nanas forest floor interrupt the street grid
+    shader.uniforms.uPlaza = { value: new THREE.Vector3(C.x, C.z, 215) };
+    shader.uniforms.uPark = { value: new THREE.Vector4(C.x + 60, C.x + 470, C.z - 470, C.z - 40) };
+    shader.uniforms.uHill = { value: new THREE.Vector3(HILL.x, HILL.z, 280) };
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nvarying vec3 vW;")
+      .replace("#include <worldpos_vertex>", "#include <worldpos_vertex>\nvW = (modelMatrix * vec4(transformed, 1.0)).xyz;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+         varying vec3 vW; uniform float uRot; uniform vec3 uPlaza; uniform vec4 uPark; uniform vec3 uHill;
+         float gh(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5); }`,
+      )
+      .replace(
+        "#include <color_fragment>",
+        `#include <color_fragment>
+         {
+           float c = cos(uRot), s = sin(uRot);
+           vec2 g = vec2(vW.x * c - vW.z * s, vW.x * s + vW.z * c);
+           vec2 cell = floor(g / ${f(BLOCK)} + 0.5);
+           vec2 d = abs(g - cell * ${f(BLOCK)});
+           vec2 halfW = vec2(abs(mod(cell.x, ${f(AVENUE_EVERY)})) < 0.5 ? ${f(AVENUE / 2)} : ${f(ROAD / 2)},
+                             abs(mod(cell.y, ${f(AVENUE_EVERY)})) < 0.5 ? ${f(AVENUE / 2)} : ${f(ROAD / 2)});
+           float roadX = 1.0 - step(halfW.x, d.x);
+           float roadZ = 1.0 - step(halfW.y, d.y);
+           float road = max(roadX, roadZ);
+           float pave = max(1.0 - step(halfW.x + 4.0, d.x), 1.0 - step(halfW.y + 4.0, d.y)) * (1.0 - road);
+           float dash = step(0.5, fract((roadX > 0.5 ? g.y : g.x) / 9.0));
+           float line = (roadX * (1.0 - step(0.2, d.x)) + roadZ * (1.0 - step(0.2, d.y))) * dash * (1.0 - roadX * roadZ);
+           vec2 blk = floor(g / ${f(BLOCK)});
+           float lawn = step(0.72, gh(blk));
+           vec3 lot = mix(vec3(0.42, 0.40, 0.37), vec3(0.20, 0.30, 0.15), lawn);
+           lot *= 0.85 + 0.3 * gh(floor(g / 9.0));
+           vec3 col = lot;
+           col = mix(col, vec3(0.55, 0.53, 0.5), pave);
+           col = mix(col, vec3(0.09, 0.09, 0.1) * (0.9 + 0.2 * gh(floor(g / 3.0))), road);
+           col = mix(col, vec3(0.8, 0.78, 0.7), line);
+           float plaza = 1.0 - smoothstep(uPlaza.z - 6.0, uPlaza.z, length(vW.xz - uPlaza.xy));
+           float park = step(uPark.x, vW.x) * step(vW.x, uPark.y) * step(uPark.z, vW.z) * step(vW.z, uPark.w);
+           float hill = 1.0 - smoothstep(uHill.z - 20.0, uHill.z, length(vW.xz - uHill.xy));
+           vec3 stone = vec3(0.62, 0.6, 0.56) * (0.9 + 0.1 * gh(floor(vW.xz / 4.0)));
+           vec3 grass = vec3(0.17, 0.27, 0.12) * (0.85 + 0.3 * gh(floor(vW.xz / 7.0)));
+           col = mix(col, stone, plaza);
+           col = mix(col, grass, max(park, hill) * (1.0 - plaza));
+           diffuseColor.rgb = col;
+         }`,
+      );
   };
-  // Body: leaning forward ~30°, broad chest.
-  add(new THREE.SphereGeometry(0.1, 20, 14), [0.0, 0.2, 0], -0.5, [1.0, 1.75, 0.9]);
-  // Head + neck
-  add(new THREE.SphereGeometry(0.062, 18, 12), [0.085, 0.385, 0], 0, [1.15, 1, 0.95]);
-  add(new THREE.CylinderGeometry(0.045, 0.07, 0.1, 12), [0.06, 0.33, 0], -0.45);
-  // Hooked beak
-  add(new THREE.ConeGeometry(0.022, 0.075, 10), [0.155, 0.37, 0], -Math.PI / 2 - 0.55);
-  // Folded wing riding the back, tips crossing past the tail
-  add(new THREE.SphereGeometry(0.1, 16, 10), [-0.04, 0.17, 0.02], -0.62, [0.62, 2.05, 0.55]);
-  // Tail
-  add(new THREE.BoxGeometry(0.045, 0.2, 0.08), [-0.135, -0.02, 0], -0.55);
-  // Legs gripping the finial
-  add(new THREE.CylinderGeometry(0.009, 0.009, 0.09, 6), [0.02, 0.03, 0.025]);
-  add(new THREE.CylinderGeometry(0.009, 0.009, 0.09, 6), [0.02, 0.03, -0.025]);
-  return g;
+  return mat;
+}
+
+// River / lake water: sky reflections with drifting ripples.
+function createWaterMaterial() {
+  const mat = new THREE.MeshStandardMaterial({ color: 0x23332c, roughness: 0.05, metalness: 0.85, envMapIntensity: 1.1 });
+  const uniforms = { uTime: { value: 0 } };
+  mat.userData.uniforms = uniforms;
+  mat.customProgramCacheKey = () => "water";
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nvarying vec3 vW;")
+      .replace("#include <worldpos_vertex>", "#include <worldpos_vertex>\nvW = (modelMatrix * vec4(transformed, 1.0)).xyz;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nvarying vec3 vW; uniform float uTime;")
+      .replace(
+        "#include <normal_fragment_maps>",
+        `#include <normal_fragment_maps>
+         {
+           vec2 p = vW.xz;
+           float a = sin(p.x * 0.35 + uTime * 1.3) * cos(p.y * 0.21 - uTime * 0.9);
+           float b = sin(p.x * 1.1 - p.y * 0.8 + uTime * 2.1);
+           vec3 n = normalize(vec3(a * 0.06 + b * 0.025, 1.0, b * 0.05 - a * 0.03));
+           normal = normalize((viewMatrix * vec4(n, 0.0)).xyz);
+         }`,
+      );
+  };
+  return mat;
 }
