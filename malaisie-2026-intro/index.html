@@ -1,0 +1,159 @@
+<!doctype html>
+<html
+  lang="fr"
+  data-composition-variables='[{"id":"renderScale","type":"number","label":"Échelle de rendu 3D (1 = 1080p)","default":1}]'
+>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>Malaisie 2026 — Intro</title>
+    <script src="vendor/gsap/gsap.min.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/three.module.js",
+          "three/addons/": "./vendor/three/addons/"
+        }
+      }
+    </script>
+    <style>
+      @font-face {
+        font-family: "Montserrat";
+        src: url("assets/fonts/Montserrat.ttf") format("truetype");
+        font-weight: 100 900;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #05070f;
+      }
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #05070f;
+      }
+      #three-layer {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      #labels {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+      .label {
+        position: absolute;
+        width: 0;
+        height: 0;
+        opacity: 0;
+        font-family: "Montserrat", sans-serif;
+        color: #f1ddbb;
+      }
+      .label .tag {
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        white-space: nowrap;
+        text-shadow: 0 2px 10px rgba(18, 12, 10, 0.85), 0 0 2px rgba(18, 12, 10, 0.9);
+      }
+      .label .name {
+        font-weight: 600;
+        font-size: 26px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+      .label .sub {
+        font-weight: 400;
+        font-size: 17px;
+        letter-spacing: 0.04em;
+        color: #f7d88f;
+      }
+      .label .leader {
+        position: absolute;
+        height: 1.5px;
+        background: linear-gradient(90deg, rgba(247, 216, 143, 0.9), rgba(247, 216, 143, 0.2));
+        transform-origin: 0 50%;
+      }
+      /* Per-stop placement around the marker so labels never collide. */
+      #lbl-kl .tag {
+        right: 34px;
+        top: 6px;
+        align-items: flex-end;
+      }
+      #lbl-kl .leader {
+        width: 28px;
+        left: -30px;
+        top: 18px;
+      }
+      #lbl-batu .tag {
+        right: 74px;
+        bottom: 44px;
+        align-items: flex-end;
+      }
+      #lbl-batu .leader {
+        width: 86px;
+        left: 0;
+        top: 0;
+        transform: rotate(-150deg);
+      }
+      #lbl-perhentian .tag {
+        left: 30px;
+        top: -18px;
+      }
+      #lbl-singapour .tag {
+        left: 30px;
+        top: -10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="22"
+      data-fps="24"
+      data-width="1920"
+      data-height="1080"
+    >
+      <canvas id="three-layer" width="1920" height="1080"></canvas>
+      <div id="labels">
+        <div class="label" id="lbl-kl">
+          <div class="leader"></div>
+          <div class="tag"><span class="name">Kuala Lumpur</span><span class="sub">départ</span></div>
+        </div>
+        <div class="label" id="lbl-batu">
+          <div class="leader"></div>
+          <div class="tag"><span class="name">Batu Caves</span><span class="sub">quad dans la jungle</span></div>
+        </div>
+        <div class="label" id="lbl-perhentian">
+          <div class="tag"><span class="name">Îles Perhentian</span></div>
+        </div>
+        <div class="label" id="lbl-singapour">
+          <div class="tag"><span class="name">Singapour</span></div>
+        </div>
+      </div>
+    </div>
+    <script>
+      // The 3D scene is driven by the Three.js adapter (hf-seek); this paused timeline
+      // only anchors the composition clock to the full 22 s.
+      const tl = gsap.timeline({ paused: true });
+      tl.set({}, {}, 22);
+      window.__timelines["main"] = tl;
+    </script>
+    <script type="module" src="src/main.js"></script>
+  </body>
+</html>
